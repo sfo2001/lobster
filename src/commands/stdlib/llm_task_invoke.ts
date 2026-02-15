@@ -439,6 +439,19 @@ function buildClawdEndpoint(clawdUrl: string) {
 }
 
 async function invokeRemoteViaClawd({ endpoint, token, payload }: { endpoint: URL; token: string; payload: any }) {
+  // Transform lobster payload fields to llm-task tool parameter names.
+  // Lobster uses artifacts/outputSchema/maxOutputTokens; the gateway expects input/schema/maxTokens.
+  const { artifacts, artifactHashes, outputSchema, schemaVersion,
+          retryContext, maxOutputTokens, ...passthrough } = payload;
+  const toolArgs: Record<string, any> = { ...passthrough };
+  if (Array.isArray(artifacts) && artifacts.length > 0) {
+    const values = artifacts.map((a: any) => a.data ?? a.text ?? a);
+    toolArgs.input = values.length === 1 ? values[0] : values;
+  }
+  if (outputSchema) toolArgs.schema = outputSchema;
+  if (Number.isFinite(maxOutputTokens)) toolArgs.maxTokens = maxOutputTokens;
+  if (retryContext) toolArgs.retryContext = retryContext;
+
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: {
@@ -448,7 +461,7 @@ async function invokeRemoteViaClawd({ endpoint, token, payload }: { endpoint: UR
     body: JSON.stringify({
       tool: 'llm-task',
       action: 'invoke',
-      args: payload,
+      args: toolArgs,
     }),
   });
 
@@ -478,12 +491,30 @@ async function invokeRemoteViaClawd({ endpoint, token, payload }: { endpoint: UR
       return inner as LlmTaskResponseEnvelope;
     }
 
+    // OpenClaw gateway format: { content: [{type, text}], details: {json, provider, model} }
+    if (inner && typeof inner === 'object' && 'content' in inner && Array.isArray(inner.content)) {
+      const textItem = inner.content.find((c: any) => c?.type === 'text');
+      const details = (inner as any).details;
+      const contentText: string | undefined = textItem?.text;
+      const data = details?.json ?? (contentText ? tryParseJson(contentText) : undefined);
+      const output: Record<string, any> = { format: data ? 'json' : 'text' };
+      if (contentText !== undefined) output.text = contentText;
+      if (data !== undefined) output.data = data;
+      const result: Record<string, any> = { output };
+      if (details?.model) result.model = details.model;
+      return { ok: true, result } as LlmTaskResponseEnvelope;
+    }
+
     // Otherwise treat it as raw result.
     return { ok: true, result: inner } as LlmTaskResponseEnvelope;
   }
 
   // Compatibility: raw JSON
   return { ok: true, result: parsed } as LlmTaskResponseEnvelope;
+}
+
+function tryParseJson(text: string): any {
+  try { return JSON.parse(text); } catch { return null; }
 }
 
 function normalizeResult({
